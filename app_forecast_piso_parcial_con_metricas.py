@@ -437,188 +437,34 @@ def crecimiento_ytd(historial, ano_objetivo):
 
 
 def aplicar_ajuste_estacional(pred_base, historial, periodo):
-    """Ajuste estacional con piso parcial, no rígido.
-
-    La referencia del año anterior protege contra subestimaciones extremas, pero
-    nunca sustituye automáticamente la predicción. Si el modelo queda debajo del
-    piso parcial, solo se recupera 40% de la distancia hacia dicho piso.
-    """
     mes = periodo % 100
     ano = periodo // 100
     indice = indice_estacional(historial, ano)
-
     mismos = historial[
-        (historial["MES_NUM"] == mes)
-        & (historial["AÑO"] < ano)
+        (historial["MES_NUM"] == mes) & (historial["AÑO"] < ano)
     ].sort_values("AÑO").tail(2)
 
-    diagnostico = {
-        "Indice_estacional": float(indice),
-        "Referencia_ultimo_ano": np.nan,
-        "Referencia_historica": np.nan,
-        "Crecimiento_YTD": 1.0,
-        "Referencia_YTD": np.nan,
-        "Prediccion_estacional": float(pred_base),
-        "Referencia_suavizada": np.nan,
-        "Prediccion_combinada": float(pred_base),
-        "Piso_parcial": np.nan,
-        "Correccion_piso": 0.0,
-        "Ajuste_aplicado": False,
-    }
-
     if mismos.empty or indice < UMBRAL_ESTACIONAL:
-        return max(0.0, float(pred_base)), diagnostico
+        return float(pred_base)
 
     valores = mismos["VENTA"].astype(float).to_numpy()
-    ultimo_ano = float(valores[-1])
-    referencia_historica = (
-        ultimo_ano
+    referencia = (
+        valores[-1]
         if len(valores) == 1
-        else 0.65 * ultimo_ano + 0.35 * float(valores[-2])
+        else 0.65 * valores[-1] + 0.35 * valores[-2]
     )
-
     crec = crecimiento_ytd(historial, ano)
-    referencia_ytd = referencia_historica * crec
-
-    prediccion_estacional = (
-        PESO_FORECAST_ESTACIONAL * float(pred_base)
-        + (1.0 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
+    referencia_ytd = referencia * crec
+    ajustada = (
+        PESO_FORECAST_ESTACIONAL * pred_base
+        + (1 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
     )
-
-    # Referencia suavizada: transfiere 50% de la tendencia YTD y la limita.
-    crecimiento_suavizado = float(np.clip(
-        1.0 + 0.50 * (crec - 1.0),
-        0.90,
-        1.20,
-    ))
-    referencia_suavizada = ultimo_ano * crecimiento_suavizado
-
-    # Ensamble principal: 90% señal del modelo estacional, 10% referencia suave.
-    prediccion_combinada = (
-        0.90 * float(prediccion_estacional)
-        + 0.10 * float(referencia_suavizada)
-    )
-
-    # Piso PARCIAL: acepta disminuciones, pero controla caídas extremas.
-    # El piso puede estar entre 94% y 115% del mismo mes del último año.
-    factor_piso = float(np.clip(
-        1.0 + 0.35 * (crec - 1.0),
-        0.94,
-        1.15,
-    ))
-    piso_parcial = ultimo_ano * factor_piso
-
-    # Si queda debajo, solo recupera 40% de la distancia. No copia el piso.
-    if prediccion_combinada < piso_parcial:
-        correccion_piso = 0.40 * (piso_parcial - prediccion_combinada)
-        prediccion_final = prediccion_combinada + correccion_piso
-    else:
-        correccion_piso = 0.0
-        prediccion_final = prediccion_combinada
-
-    diagnostico.update({
-        "Referencia_ultimo_ano": ultimo_ano,
-        "Referencia_historica": float(referencia_historica),
-        "Crecimiento_YTD": float(crec),
-        "Referencia_YTD": float(referencia_ytd),
-        "Prediccion_estacional": float(prediccion_estacional),
-        "Referencia_suavizada": float(referencia_suavizada),
-        "Prediccion_combinada": float(prediccion_combinada),
-        "Piso_parcial": float(piso_parcial),
-        "Correccion_piso": float(correccion_piso),
-        "Ajuste_aplicado": True,
-    })
-    return max(0.0, float(prediccion_final)), diagnostico
-
-
-def calcular_metricas(y_real, y_pred):
-    y_real = np.asarray(y_real, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    denominador = float(np.abs(y_real).sum())
-    wape = 100.0 * np.abs(y_real - y_pred).sum() / denominador if denominador > 0 else np.nan
-    mae = float(np.mean(np.abs(y_real - y_pred)))
-    rmse = float(np.sqrt(np.mean((y_real - y_pred) ** 2)))
-    if len(y_real) > 1 and np.var(y_real) > 0:
-        r2 = 1.0 - np.sum((y_real - y_pred) ** 2) / np.sum((y_real - y_real.mean()) ** 2)
-    else:
-        r2 = np.nan
-    sesgo = 100.0 * (y_pred.sum() - y_real.sum()) / denominador if denominador > 0 else np.nan
-    return {
-        "WAPE": float(wape), "MAE": mae, "RMSE": rmse,
-        "R2": float(r2) if pd.notna(r2) else np.nan,
-        "SESGO": float(sesgo),
-        "REAL": float(y_real.sum()), "PRED": float(y_pred.sum()),
-    }
+    piso = valores[-1] * (1 + 0.35 * max(crec - 1, 0))
+    return max(float(ajustada), float(piso))
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-backtest-v1"):
-    """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
-    train = df[df["Periodo"] < 202511].copy()
-    real = df[df["Periodo"].isin([202511, 202512])].copy()
-    if train.empty or real.empty:
-        return pd.DataFrame()
-
-    modelos = entrenar_modelos(train)
-    filas = []
-    codigos = sorted(set(train["CODIGO"]) & set(real["CODIGO"]))
-
-    for codigo in codigos:
-        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
-        observado = real[real["CODIGO"] == codigo].sort_values("Periodo")
-        periodos = observado["Periodo"].astype(int).tolist()
-        if hist.empty or not periodos:
-            continue
-
-        venta_directa = predecir_objetivo(*modelos["VENTA"], hist, periodos, "VENTA")
-        unidades = predecir_objetivo(*modelos["UNIDADES"], hist, periodos, "UNIDADES")
-        precio = predecir_objetivo(*modelos["PRECIO_PROMEDIO"], hist, periodos, "PRECIO_PROMEDIO")
-
-        for (_, rr), vd, unid, precio_prom in zip(
-            observado.iterrows(), venta_directa, unidades, precio
-        ):
-            estructural = float(unid) * float(precio_prom)
-            base = PESO_VENTA_DIRECTA * float(vd) + PESO_ESTRUCTURAL * estructural
-            pred_final, diag = aplicar_ajuste_estacional(base, hist, int(rr["Periodo"]))
-            filas.append({
-                "CODIGO": codigo,
-                "DESCRIPCION": rr.get("DESCRIPCION", ""),
-                "CATEGORIA": rr.get("CATEGORIA", "SIN_DATO"),
-                "COMBOS": int(rr.get("COMBOS", 0)),
-                "Periodo": int(rr["Periodo"]),
-                "Actual": float(rr["VENTA"]),
-                "Prediccion_base": float(base),
-                "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
-                "Crecimiento_YTD": diag["Crecimiento_YTD"],
-                "Prediccion_estacional": diag["Prediccion_estacional"],
-                "Referencia_suavizada": diag["Referencia_suavizada"],
-                "Prediccion_combinada": diag["Prediccion_combinada"],
-                "Piso_parcial": diag["Piso_parcial"],
-                "Correccion_piso": diag["Correccion_piso"],
-                "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_final": float(pred_final),
-            })
-    return pd.DataFrame(filas)
-
-
-def tabla_metricas_por_mes(detalle):
-    filas = []
-    for periodo, grupo in detalle.groupby("Periodo"):
-        m = calcular_metricas(grupo["Actual"], grupo["Prediccion_final"])
-        filas.append({"Periodo": int(periodo), "SKU": grupo["CODIGO"].nunique(), **m})
-    return pd.DataFrame(filas).sort_values("Periodo") if filas else pd.DataFrame()
-
-
-def tabla_metricas_por_categoria(detalle):
-    filas = []
-    for categoria, grupo in detalle.groupby("CATEGORIA", dropna=False):
-        m = calcular_metricas(grupo["Actual"], grupo["Prediccion_final"])
-        filas.append({"CATEGORIA": str(categoria), "SKU": grupo["CODIGO"].nunique(), **m})
-    return pd.DataFrame(filas).sort_values("REAL", ascending=False) if filas else pd.DataFrame()
-
-
-@st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="piso-parcial-v1"):
+def generar_forecast(df):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -652,29 +498,14 @@ def generar_forecast(df, version_modelo="piso-parcial-v1"):
                 PESO_VENTA_DIRECTA * vd
                 + PESO_ESTRUCTURAL * estructural
             )
-            final, diag = aplicar_ajuste_estacional(base, hist, periodo)
+            final = aplicar_ajuste_estacional(base, hist, periodo)
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
                 "CATEGORIA": str(meta.get("CATEGORIA", "SIN_DATO")).strip(),
                 "COMBOS": int(meta.get("COMBOS", 0)),
                 "Periodo": periodo,
-                "Venta_directa": float(vd),
-                "Unidades_pred": float(unid),
-                "Precio_pred": float(precio_prom),
-                "Venta_estructural": float(estructural),
-                "Prediccion_base": float(base),
-                "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
-                "Crecimiento_YTD": diag["Crecimiento_YTD"],
-                "Referencia_YTD": diag["Referencia_YTD"],
-                "Prediccion_estacional": diag["Prediccion_estacional"],
-                "Referencia_suavizada": diag["Referencia_suavizada"],
-                "Prediccion_combinada": diag["Prediccion_combinada"],
-                "Piso_parcial": diag["Piso_parcial"],
-                "Correccion_piso": diag["Correccion_piso"],
-                "Indice_estacional": diag["Indice_estacional"],
-                "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_final": float(final),
+                "Prediccion_final": final,
             })
 
     return pd.DataFrame(filas)
@@ -763,76 +594,6 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Validación del ajuste con piso parcial")
-        excluir_combos_bt = st.checkbox(
-            "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
-        )
-        if st.button("Calcular métricas del piso parcial Nov-Dic 2025", type="primary"):
-            progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
-            try:
-                detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_suavizado"] = detalle_bt
-                progreso_bt.progress(1.0, text="Backtest completado")
-                st.rerun()
-            except Exception as error_bt:
-                progreso_bt.empty()
-                st.exception(error_bt)
-
-        if "detalle_backtest_suavizado" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_suavizado"].copy()
-            evaluado_bt = (
-                detalle_bt[detalle_bt["COMBOS"] == 0].copy()
-                if excluir_combos_bt else detalle_bt.copy()
-            )
-            if evaluado_bt.empty:
-                st.warning("No quedaron registros para evaluar con el filtro seleccionado.")
-            else:
-                metricas_bt = calcular_metricas(
-                    evaluado_bt["Actual"], evaluado_bt["Prediccion_final"]
-                )
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("WAPE", f"{metricas_bt['WAPE']:.2f}%")
-                m2.metric("MAE", f"${metricas_bt['MAE']:,.2f}")
-                m3.metric("RMSE", f"${metricas_bt['RMSE']:,.2f}")
-                m4.metric("R²", f"{metricas_bt['R2']:.4f}" if pd.notna(metricas_bt['R2']) else "N/D")
-                m5.metric("Sesgo", f"{metricas_bt['SESGO']:+.2f}%")
-                st.caption(
-                    f"Venta real: ${metricas_bt['REAL']:,.2f} | "
-                    f"Pronóstico con piso parcial: ${metricas_bt['PRED']:,.2f} | "
-                    f"{evaluado_bt['CODIGO'].nunique():,} SKU"
-                )
-
-                tab_mes, tab_categoria, tab_detalle = st.tabs([
-                    "Por mes", "Por categoría", "Detalle SKU"
-                ])
-                formato = {
-                    "WAPE": "{:.2f}%", "MAE": "${:,.2f}",
-                    "RMSE": "${:,.2f}", "R2": "{:.4f}",
-                    "SESGO": "{:+.2f}%", "REAL": "${:,.2f}",
-                    "PRED": "${:,.2f}",
-                }
-                with tab_mes:
-                    por_mes = tabla_metricas_por_mes(evaluado_bt)
-                    st.dataframe(
-                        por_mes.style.format(formato),
-                        use_container_width=True, hide_index=True,
-                    )
-                with tab_categoria:
-                    por_categoria = tabla_metricas_por_categoria(evaluado_bt)
-                    st.dataframe(
-                        por_categoria.style.format(formato),
-                        use_container_width=True, hide_index=True,
-                    )
-                with tab_detalle:
-                    st.dataframe(evaluado_bt, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "Descargar backtest suavizado CSV",
-                        evaluado_bt.to_csv(index=False).encode("utf-8-sig"),
-                        "backtest_suavizado_nov_dic_2025.csv",
-                        "text/csv",
-                    )
-
-        st.divider()
         if "forecast_2026" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
@@ -981,38 +742,9 @@ if archivos:
                 "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
-            with st.expander("Diagnóstico del ajuste estacional"):
-                diagnostico_visible = forecast.copy()
-                if categoria != "TODAS":
-                    diagnostico_visible = diagnostico_visible[diagnostico_visible["CATEGORIA"] == categoria]
-                if combo != "TODOS":
-                    diagnostico_visible = diagnostico_visible[
-                        diagnostico_visible["COMBOS"] == (1 if combo == "COMBOS" else 0)
-                    ]
-                if producto != "TODOS":
-                    diagnostico_visible = diagnostico_visible[
-                        diagnostico_visible["CODIGO"].astype(str) == producto
-                    ]
-                columnas_diag = [
-                    "CODIGO", "DESCRIPCION", "CATEGORIA", "Periodo",
-                    "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
-                    "Referencia_YTD", "Prediccion_estacional", "Referencia_suavizada",
-                    "Prediccion_combinada", "Piso_parcial", "Correccion_piso",
-                    "Indice_estacional", "Ajuste_aplicado", "Prediccion_final",
-                ]
-                st.dataframe(
-                    diagnostico_visible[columnas_diag],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.download_button(
-                    "Descargar diagnóstico CSV",
-                    diagnostico_visible[columnas_diag].to_csv(index=False).encode("utf-8-sig"),
-                    "diagnostico_forecast_nov_dic_2026.csv",
-                    "text/csv",
-                )
 
     except Exception as error:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
