@@ -107,13 +107,6 @@ def cargar_archivos(archivos):
     for archivo in archivos:
         nombre = archivo.name
         ano_archivo = _inferir_ano(nombre)
-        if ano_archivo not in {2024, 2025, 2026}:
-            diagnostico.append({
-                "Archivo": nombre, "Hoja": "-", "Estado": "ERROR",
-                "Filas": 0, "Año asignado": ano_archivo,
-                "Detalle": "El nombre debe contener 2024, 2025 o 2026",
-            })
-            continue
 
         try:
             contenido = archivo.getvalue()
@@ -145,6 +138,19 @@ def cargar_archivos(archivos):
                 })
                 continue
 
+            # El año se resuelve en este orden: nombre del archivo, nombre de hoja,
+            # columna AÑO. Esto evita rechazar archivos renombrados por Streamlit/GitHub.
+            ano_hoja = _inferir_ano(hoja)
+            col_ano_original = _buscar_columna(h.columns, ["AÑO", "ANO", "YEAR"])
+            anos_columna = []
+            if col_ano_original is not None:
+                anos_columna = (
+                    pd.to_numeric(h[col_ano_original], errors="coerce")
+                    .dropna().astype(int).loc[lambda x: x.isin([2024, 2025, 2026])]
+                    .unique().tolist()
+                )
+            ano_resuelto = ano_archivo or ano_hoja or (anos_columna[0] if len(anos_columna) == 1 else None)
+
             columnas = {
                 destino: _buscar_columna(
                     h.columns,
@@ -155,6 +161,8 @@ def cargar_archivos(archivos):
             }
             obligatorias = ["CODIGO", "VENTA", "UNIDADES"]
             faltantes = [c for c in obligatorias if columnas[c] is None]
+            if ano_resuelto not in {2024, 2025, 2026}:
+                faltantes.append("AÑO")
             mes_hoja = _inferir_mes(hoja)
             if columnas["MES"] is None and mes_hoja is None:
                 faltantes.append("MES")
@@ -162,7 +170,7 @@ def cargar_archivos(archivos):
             if faltantes:
                 diagnostico.append({
                     "Archivo": nombre, "Hoja": hoja, "Estado": "OMITIDA",
-                    "Filas": len(h), "Año asignado": ano_archivo,
+                    "Filas": len(h), "Año asignado": ano_resuelto,
                     "Detalle": "Faltan columnas: " + ", ".join(faltantes),
                 })
                 continue
@@ -171,7 +179,7 @@ def cargar_archivos(archivos):
             temp["CODIGO"] = h[columnas["CODIGO"]]
             temp["VENTA"] = h[columnas["VENTA"]]
             temp["UNIDADES"] = h[columnas["UNIDADES"]]
-            temp["AÑO"] = ano_archivo
+            temp["AÑO"] = int(ano_resuelto)
 
             if columnas["MES"] is not None:
                 mes_original = h[columnas["MES"]]
@@ -209,7 +217,7 @@ def cargar_archivos(archivos):
             if temp.empty:
                 diagnostico.append({
                     "Archivo": nombre, "Hoja": hoja, "Estado": "OMITIDA",
-                    "Filas": 0, "Año asignado": ano_archivo,
+                    "Filas": 0, "Año asignado": ano_resuelto,
                     "Detalle": "No quedaron filas válidas después de limpiar",
                 })
                 continue
@@ -217,7 +225,7 @@ def cargar_archivos(archivos):
             partes.append(temp)
             diagnostico.append({
                 "Archivo": nombre, "Hoja": hoja, "Estado": "CARGADA",
-                "Filas": len(temp), "Año asignado": ano_archivo,
+                "Filas": len(temp), "Año asignado": ano_resuelto,
                 "Detalle": (
                     f"{temp['CODIGO'].nunique()} SKU | meses {sorted(temp['MES_NUM'].unique().tolist())} | "
                     f"unidades leídas desde: {columnas['UNIDADES']}"
@@ -225,8 +233,16 @@ def cargar_archivos(archivos):
             })
 
     if not partes:
+        detalle_error = pd.DataFrame(diagnostico)
+        if not detalle_error.empty:
+            resumen_error = "\n".join(
+                f"{r.get('Archivo', '')} | {r.get('Hoja', '')}: {r.get('Detalle', '')}"
+                for _, r in detalle_error.head(20).iterrows()
+            )
+        else:
+            resumen_error = "No se recibieron archivos o pandas no pudo abrirlos."
         raise ValueError(
-            "Ninguna hoja pudo cargarse. Abre el diagnóstico y revisa los encabezados."
+            "Ninguna hoja pudo cargarse. Diagnóstico inicial:\n" + resumen_error
         )
 
     df = pd.concat(partes, ignore_index=True)
@@ -1081,3 +1097,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
